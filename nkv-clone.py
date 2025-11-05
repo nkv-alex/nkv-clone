@@ -7,7 +7,10 @@ import subprocess
 import shutil
 import time
 import json
-
+import socket    
+import struct 
+import threading                  
+from pathlib import Path
 
 ######################
 ###  OS FUNCTIONS  ###
@@ -22,7 +25,8 @@ def run(cmd, check=True):
 #####################
 ##  MAIN VARIABLES ##
 #####################
-
+HEADER_FMT = "!I Q"                # formato: I=uint32 (len nombre), Q=uint64 (tamaño archivo)
+HEADER_SIZE = struct.calcsize(HEADER_FMT)  # tamaño en bytes del header fijo
 Mode = ""
 UDP_PORT = 49999
 config_file = "nkv-clone-config.json"
@@ -138,105 +142,135 @@ def detect_interfaces():
     return interfaces
 
 
-def send_to_hosts(payload, port=UDP_PORT, timeout=2.0, send=True):
-    import socket, struct, fcntl, time, uuid, json, os
 
-    DISCOVER_MESSAGE_PREFIX = "DISCOVER_REQUEST"
-    RESPONSE_PREFIX = "DISCOVER_RESPONSE"
-    HOSTS_FILE = "nkv-clone-coms.json"
 
-    
-    global interfaces
-    internals = [iface for iface, v in interfaces.items() if v["type"] == "internal"]
+# Uso: python file_transfer.py server 0.0.0.0 9000 ./received
+#       python file_transfer.py send 192.168.1.10 9000 ./data.json
 
-    def get_broadcast(iface):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def send_file(dest_ip: str, dest_port: int, filepath: str) -> None:
+    """
+    Cliente: conecta al servidor y envía un archivo.
+    """
+    path = Path(filepath)
+    if not path.is_file():
+        raise FileNotFoundError(f"Archivo no encontrado: {filepath}")
+
+    filename_bytes = path.name.encode("utf-8")           # nombre en bytes
+    filename_len = len(filename_bytes)                   # len nombre
+    filesize = path.stat().st_size                       # tamaño en bytes
+
+    # abrir socket y conectar
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((dest_ip, dest_port))                  # conexión TCP
+        # enviar header: len(nombre) (4 bytes) + filesize (8 bytes)
+        header = struct.pack(HEADER_FMT, filename_len, filesize)
+        s.sendall(header)
+        # enviar nombre
+        s.sendall(filename_bytes)
+
+        # enviar contenido en chunks
+        # para no saturar memoria
+        with open(path, "rb") as f:
+            sent = 0
+            while True:
+                chunk = f.read(64 * 1024)                # 64KB por chunk
+                if not chunk:
+                    break
+                s.sendall(chunk)
+                sent += len(chunk)
+
+
+def _recv_all(sock: socket.socket, n: int) -> bytes:
+    """
+    Lee exactamente n bytes del socket (bloqueante hasta obtenerlos o error).
+    """
+    data = bytearray()
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
+            raise ConnectionError("Conexión cerrada inesperadamente mientras se leía")
+        data.extend(packet)
+    return bytes(data)
+
+
+def handle_client(conn: socket.socket, addr: tuple, save_dir: str) -> None:
+    """
+    Worker del servidor para una conexión entrante: recibe header, nombre y archivo.
+    """
+    try:
+        # leer header fijo
+        header_bytes = _recv_all(conn, HEADER_SIZE)
+        name_len, filesize = struct.unpack(HEADER_FMT, header_bytes)
+
+        # leer nombre del archivo 
+        name_bytes = _recv_all(conn, name_len)
+        filename = name_bytes.decode("utf-8")
+
+        # asegurar directorio destino
+        os.makedirs(save_dir, exist_ok=True)
+        dest_path = Path(save_dir) / filename
+
+        # escribir contenido en chunks hasta filesize
+        remaining = filesize
+        with open(dest_path, "wb") as f:
+            while remaining > 0:
+                chunk_size = 64 * 1024 if remaining >= 64 * 1024 else remaining
+                chunk = conn.recv(chunk_size)
+                if not chunk:
+                    raise ConnectionError("Conexión cerrada durante la transferencia")
+                f.write(chunk)
+                remaining -= len(chunk)
+        # conexión finalizada, archivo guardado
+    except Exception as e:
+        # logging mínimo
+        print(f"[ERROR] {addr}: {e}")
+    finally:
+        conn.close()
+
+def start_server(listen_ip: str, listen_port: int, save_dir: str) -> None:
+    """
+    Levanta el servidor que acepta múltiples envíos concurrentes.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((listen_ip, listen_port))
+        srv.listen(8)  
+        print(f"[INFO] Server listening on {listen_ip}:{listen_port}, saving to {save_dir}")
+
         try:
-            return socket.inet_ntoa(fcntl.ioctl(
-                s.fileno(),
-                0x8919,  # SIOCGIFBRDADDR
-                struct.pack('256s', iface.encode('utf-8')[:15])
-            )[20:24])
-        except Exception as e:
-            print(f"[net] Error getting broadcast for {iface}: {e}")
-            return "255.255.255.255"
-
-    def save_hosts(discovered):
-        try:
-            with open(HOSTS_FILE, "w") as f:
-                json.dump(discovered, f, indent=2)
-            print(f"[store] {len(discovered)} hosts saved in {HOSTS_FILE}")
-        except Exception as e:
-            print(f"[store] Error saving hosts: {e}")
-
-    discovered_total = {}
-
-    for iface in internals:
-        broadcast_ip = get_broadcast(iface)
-        print(f"[discover:{iface}] using broadcast {broadcast_ip}")
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(timeout)
-
-        token = str(uuid.uuid4())[:8]
-        discover_msg = f"{DISCOVER_MESSAGE_PREFIX}:{token}"
-        sock.sendto(discover_msg.encode(), (broadcast_ip, port))
-        print(f"[discover:{iface}] Broadcast sent, waiting {timeout}s...")
-
-        start_time = time.time()
-        while True:
-            try:
-                data, addr = sock.recvfrom(1024)
-                text = data.decode(errors="ignore")
-                ip, _ = addr
-                if text.startswith(RESPONSE_PREFIX):
-                    parts = text.split(":", 2)
-                    hostname = parts[1] if len(parts) > 1 else ip
-                    nodeid = parts[2] if len(parts) > 2 else ""
-                    discovered_total[ip] = {"hostname": hostname.strip(), "nodeid": nodeid.strip()}
-                    print(f"[discover:{iface}] response from {ip} -> {hostname}")
-            except socket.timeout:
-                break
-            if time.time() - start_time > timeout:
-                break
-
-    if not discovered_total:
-        print("[discover] No listeners detected.")
-        return {}
-
-    print(f"[discover] Total {len(discovered_total)} hosts found:")
-    for ip, info in discovered_total.items():
-        print(f"  - {ip} ({info.get('hostname')})")
-
-    save_hosts(discovered_total)
-
-    if send:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(2.0)  
-        for ip in discovered_total.keys():
-            try:
-                sock.sendto(payload.encode(), (ip, port))
-                print(f"[send] payload sent to {ip}")
-                
-               
-                try:
-                    data, addr = sock.recvfrom(1024) 
-                    print(f"[recv] response from {addr[0]}: {data.decode(errors='ignore')}")
-                except socket.timeout:
-                    print(f"[recv] no response from {ip}")
-                
-            except Exception as e:
-                print(f"[send] failed to send to {ip}: {e}")
-
-
-    return discovered_total
+            while True:
+                conn, addr = srv.accept()
+                print(f"[INFO] Conexión entrante desde {addr}")
+                # manejar en thread separado
+                t = threading.Thread(target=handle_client, args=(conn, addr, save_dir), daemon=True)
+                t.start()
+        except KeyboardInterrupt:
+            print("[INFO] Servidor detenido por operador")
 
 
 ##############################
 ###  CHECK SYS FUNCTION    ###
 ##############################
+def check_files():
+        # Initialize or load the config dictionary
+    if os.path.exists(config_file):
+        with open(config_file, "r") as f:
+            try:
+                config = json.load(f)
+            except json.JSONDecodeError:
+                config = {}
+    else:
+        config = {}
 
+    # Update services status
+    for service in services:
+        if service == "":
+            continue
+        config[service] = True
+
+    # Save the updated configuration
+    with open(config_file, "w") as f:
+        json.dump(config, f, indent=4)
 
 
 
@@ -246,13 +280,28 @@ def send_to_hosts(payload, port=UDP_PORT, timeout=2.0, send=True):
 ###  MAIN LOGIC     ###
 #######################
 def main():
-    for service in services:
-            if service == "":
-                continue
-            else:
-                with open(config_file, "r") as f:
-                    config = json.dump(service, f, indent=4)
+        # CLI sencillo
+    if len(sys.argv) < 2:
+        print("Uso mínimo: server|send ...")
+        sys.exit(1)
 
+    mode = sys.argv[1].lower()
+    if mode == "server":
+        if len(sys.argv) != 5:
+            print("Uso: python file_transfer.py server <listen_ip> <port> <save_dir>")
+            sys.exit(1)
+        _, _, ip, port_s, save_dir = sys.argv
+        start_server(ip, int(port_s), save_dir)
+    elif mode == "send":
+        if len(sys.argv) != 5:
+            print("Uso: python file_transfer.py send <dest_ip> <port> <file_path>")
+            sys.exit(1)
+        _, _, ip, port_s, file_path = sys.argv
+        send_file(ip, int(port_s), file_path)
+        print("[INFO] Envío completado")
+    else:
+        print("Modo desconocido. Usa 'server' o 'send'.")
+        sys.exit(1)
 
 
 
