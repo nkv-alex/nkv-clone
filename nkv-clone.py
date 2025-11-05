@@ -27,16 +27,16 @@ Mode = ""
 UDP_PORT = 49999
 config_file = "nkv-clone-config.json"
 interfaces_json = "interfaces.json"
-SERVICIOS = [
-    "sshd",
-    "nginx",
-    "cron",
-    "docker",
-    "network-manager",
-    "dnsmasq"
-    "nfs-server",
-    "smbd",
-    "isc-dhcp-server"
+services=[
+    "/etc/dnsmasq.conf",
+    "/etc/dhcp",
+    "/etc/apache2",
+    "/etc/exports",
+    "/etc/iscsi",
+    "/etc/samba",
+    "/etc/postfix",
+    "/etc/vsftpd.conf",
+    "/etc/ssh/"
 ]
 
 
@@ -236,78 +236,23 @@ def send_to_hosts(payload, port=UDP_PORT, timeout=2.0, send=True):
 ##############################
 ###  CHECK SYS FUNCTION    ###
 ##############################
-def service_status(name):
-    """
-    Verifica si el servicio existe y si está activo.
-    True = existe y está activo
-    False = existe pero está inactivo o fallido
-    No se agrega si no existe
-    """
-    # Primero verificamos si la unidad existe
-    check = subprocess.run(
-        f"systemctl list-unit-files | grep -w {name}.service",
-        shell=True,
-        capture_output=True,
-        text=True
-    )
-
-    if check.returncode != 0:
-        print(f"[WARN] {name}: servicio no encontrado en el sistema.")
-        return None
-
-    # Consultar estado actual
-    proc = subprocess.run(
-        f"systemctl is-active {name}",
-        shell=True,
-        capture_output=True,
-        text=True
-    )
-
-    status = proc.stdout.strip() or "unknown"
-    active = status in ("active", "activating", "sleeping")
-
-    # Cargar JSON existente o crear nuevo
-    data = {}
-    if os.path.exists(config_file):
-        try:
-            with open(config_file, "r") as f:
-                data = json.load(f)
-        except json.JSONDecodeError:
-            print(f"[WARN] {config_file} corrupto, se regenerará.")
-
-    # Registrar servicio aunque esté inactivo
-    data[name] = active
-
-    # Guardar cambios
-    with open(config_file, "w") as f:
-        json.dump(data, f, indent=4)
-
-    print(f"[INFO] {name}: {status} -> {active}")
-    return active
 
 
-def check_all_services():
-    """Escanea todos los servicios existentes en el sistema."""
-    result = subprocess.run(
-        "systemctl list-unit-files --type=service --no-pager --no-legend | awk '{print $1}'",
-        shell=True,
-        capture_output=True,
-        text=True
-    )
-    servicios = [s.replace(".service", "") for s in result.stdout.splitlines() if s.strip()]
 
-    print(f"[INFO] Detectados {len(servicios)} servicios.\n")
 
-    for s in servicios:
-        service_status(s)
 
 
 #######################
 ###  MAIN LOGIC     ###
 #######################
 def main():
-    check_all_services()
-    
+    for service in services:
+            if service == "":
+                continue
+            else:
+                with open(config_file, "r") as f:
+                    config = json.dump(service, f, indent=4)
+
 
 
 
